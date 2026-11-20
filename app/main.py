@@ -1,8 +1,9 @@
 """FastAPI 应用：疾控汇总发布安全审查台。
 
 页面：
-- GET /        内部审查台（导入、预览、发布；可见原始格值）
-- GET /public  公开页（仅人数与获准汇总，无格内检出数）
+- GET /          内部审查台（导入、预览、发布；可见原始格值）
+- GET /reconcile 内部核算页（多轮筛查累计检出上下界；仅内部）
+- GET /public    公开页（仅人数与获准汇总，无格内检出数）
 
 接口：
 - POST /api/import     导入调查 CSV（仅允许一次，导入后不可更换）
@@ -10,6 +11,9 @@
 - POST /api/preview    预览交集检出总数并做安全评估
 - POST /api/publish    确认发布（按最新公开记录重核后原子写入）
 - GET  /api/public     公开数据（人数 + 获准汇总）
+- GET  /api/reconcile/template  下载核算 CSV 模板（按固定调查生成）
+- POST /api/reconcile  上传核算 CSV，返回上下界/端点或冲突
+- GET  /api/reconcile/history   最近的核算记录（仅内部）
 """
 
 import asyncio
@@ -20,21 +24,26 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .database import (
     get_cells,
     get_publications,
+    get_reconciliations,
     init_db,
     insert_cells,
     insert_publication,
+    insert_reconciliation,
 )
+from .reconcile import ReconcileUnsolved, reconcile
+from .reconcile_csv import ReconcileCsvError, build_template, parse_reconcile_csv
 from .solver import evaluate
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SAMPLE_CSV = BASE_DIR / "sample_survey.csv"
+SAMPLE_RECONCILE_CSV = BASE_DIR / "sample_reconcile.csv"
 
 MAX_CELLS = 16
 MIN_POPULATION = 5
@@ -156,9 +165,20 @@ def public_page():
     return FileResponse(STATIC_DIR / "public.html")
 
 
+@app.get("/reconcile", include_in_schema=False)
+def reconcile_page():
+    """内部核算页。公开页与公开接口不提供入口，也不引用本页数据。"""
+    return FileResponse(STATIC_DIR / "reconcile.html")
+
+
 @app.get("/sample_survey.csv", include_in_schema=False)
 def sample_csv():
     return FileResponse(SAMPLE_CSV, media_type="text/csv")
+
+
+@app.get("/sample_reconcile.csv", include_in_schema=False)
+def sample_reconcile_csv():
+    return FileResponse(SAMPLE_RECONCILE_CSV, media_type="text/csv")
 
 
 # ---------------- 接口 ----------------
@@ -250,7 +270,7 @@ async def publish(sel: Selection):
 
 @app.get("/api/public")
 def public_data():
-    """公开数据：仅人数与获准汇总，绝不包含格内检出数。"""
+    """公开数据：仅人数与获准汇总，绝不包含格内检出数，也不含核算数据。"""
     cells = get_cells()
     return {
         "imported": bool(cells),
@@ -264,3 +284,84 @@ def public_data():
         ],
         "publications": get_publications(),
     }
+
+
+# ---------------- 多轮筛查累计检出核算（仅内部） ----------------
+
+
+@app.get("/api/reconcile/template")
+def reconcile_template():
+    cells = get_cells()
+    if not cells:
+        raise HTTPException(400, "尚未导入调查数据")
+    return PlainTextResponse(
+        build_template(cells),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="reconcile_template.csv"'},
+    )
+
+
+@app.get("/api/reconcile/history")
+def reconcile_history():
+    cells = get_cells()
+    return {
+        "imported": bool(cells),
+        "cells": [
+            {
+                "district": c["district"],
+                "age_group": c["age_group"],
+                "population": c["population"],
+                "detected": c["detected"],
+            }
+            for c in cells
+        ],
+        "records": get_reconciliations(),
+    }
+
+
+@app.post("/api/reconcile")
+async def reconcile_upload(file: UploadFile = File(...)):
+    """上传核算 CSV。仅在内部页使用；不写入公开记录，也不改变固定调查。"""
+    cells = get_cells()
+    if not cells:
+        raise HTTPException(400, "尚未导入调查数据")
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "文件编码须为 UTF-8")
+    try:
+        cell_inputs, pair_inputs = parse_reconcile_csv(text, cells)
+    except ReconcileCsvError as e:
+        raise HTTPException(400, str(e))
+
+    # 求解放入工作线程；求解期间其他请求不受影响。
+    try:
+        result = await asyncio.to_thread(reconcile, cells, cell_inputs, pair_inputs)
+    except ReconcileUnsolved as e:
+        raise HTTPException(503, str(e))
+
+    payload = {
+        "cells": [
+            {
+                "district": d,
+                "age_group": a,
+                **{k: int(v) for k, v in cell_inputs[(d, a)].items()},
+            }
+            for d, a in sorted(cell_inputs)
+        ],
+        "pairs": [
+            {
+                "rounds": list(pair),
+                **{k: int(v) for k, v in pair_inputs[pair].items()},
+            }
+            for pair in sorted(pair_inputs)
+        ],
+    }
+    try:
+        record = insert_reconciliation(
+            file.filename or "reconcile.csv", result["feasible"], payload, result
+        )
+    except Exception:
+        raise HTTPException(500, "核算已完成，但记录保存失败")
+    return {"record": record, "result": result}

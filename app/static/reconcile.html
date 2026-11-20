@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>多轮筛查累计检出核算（内部）</title>
+<style>
+  body{font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f4f6f8;color:#222}
+  header{background:#3f3a6e;color:#fff;padding:14px 24px;display:flex;align-items:baseline;gap:16px;flex-wrap:wrap}
+  header h1{margin:0;font-size:20px}
+  header a{color:#d9d5ff;font-size:13px}
+  header .tag{background:#6b64b8;border-radius:999px;padding:2px 10px;font-size:12px}
+  main{max-width:1080px;margin:20px auto;padding:0 16px}
+  section{background:#fff;border-radius:8px;padding:16px 20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  h2{font-size:16px;margin:0 0 12px}
+  h3{font-size:14px;margin:16px 0 8px}
+  table{border-collapse:collapse;margin-top:8px;width:100%}
+  th,td{border:1px solid #dde3ea;padding:6px 10px;font-size:13px;text-align:center}
+  th{background:#eef2f6}
+  td.left,th.left{text-align:left}
+  button{background:#3f3a6e;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-size:14px;cursor:pointer;margin-right:8px}
+  button.secondary{background:#5a6b7b}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  .msg{margin-top:12px;padding:10px 12px;border-radius:6px;font-size:14px;white-space:pre-wrap;display:none}
+  .msg.ok{display:block;background:#e6f6e8;border:1px solid #9ed3a7}
+  .msg.err{display:block;background:#fdecea;border:1px solid #f2b8b0}
+  .msg.info{display:block;background:#eef1fb;border:1px solid #c4cbe8}
+  .hint{font-size:13px;color:#667;line-height:1.6}
+  .hidden{display:none}
+  .legend{font-size:12px;color:#556;margin:6px 0}
+  .legend code{background:#eef2f6;border-radius:4px;padding:1px 5px;margin:0 2px}
+  code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  details{margin:6px 0}
+  summary{cursor:pointer;font-size:13px;color:#3f3a6e}
+  .stat{display:inline-block;background:#eef2f6;border-radius:6px;padding:6px 12px;margin-right:10px;font-size:14px}
+  .stat b{font-size:18px;color:#3f3a6e}
+  .conflict{border-left:4px solid #d9534f;padding-left:10px;margin:8px 0}
+  .sub{font-size:12px;color:#667}
+  .statecell{font-family:ui-monospace,Menlo,Consolas,monospace;letter-spacing:1px}
+  .rec{border:1px solid #dde3ea;border-radius:6px;padding:8px 12px;margin:8px 0}
+  .rec summary{font-size:13px;color:#333}
+  .badge-ok{color:#237a35;font-weight:600}
+  .badge-bad{color:#b3261e;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>多轮筛查累计检出核算</h1>
+  <span class="tag">内部使用</span>
+  <a href="/" target="_blank">← 内部审查台</a>
+  <a href="/public" target="_blank">公开页</a>
+</header>
+<main>
+  <section id="surveySec">
+    <h2>1. 固定调查（首轮）</h2>
+    <p class="hint">
+      以已导入的固定调查为首轮：在册人员即首轮受检人员，首轮检出数取自固定调查。
+      <b>本页核算不改变固定调查，也不写入公开记录。</b>
+      每人在三轮中始终归同一调查格，每轮只有「未受检 / 受检未检出 / 检出」三种状态。
+    </p>
+    <div id="survey"></div>
+    <div id="noData" class="msg err">尚未导入调查数据，请先到 <a href="/">内部审查台</a> 导入。</div>
+  </section>
+
+  <section id="uploadSec">
+    <h2>2. 上传核算 CSV</h2>
+    <p class="hint">
+      模板按当前固定调查生成：每个调查格两行（轮次 2、3），填写该轮受检人数、检出人数；
+      末尾三行轮次填 <code>1-2</code> <code>1-3</code> <code>2-3</code>，只填两轮均受检人数、两轮均检出人数。
+      格行的配对列留空，配对行的分区/年龄组及受检/检出列留空。
+    </p>
+    <button class="secondary" onclick="downloadTemplate()">下载模板 CSV</button>
+    <input type="file" id="file" accept=".csv" style="margin:0 8px">
+    <button onclick="doUpload()">上传并核算</button>
+    <button class="secondary" onclick="demoUpload()">载入演示数据</button>
+    <div id="upMsg" class="msg"></div>
+  </section>
+
+  <section id="resultSec" class="hidden">
+    <h2>3. 核算结果</h2>
+    <div id="result"></div>
+  </section>
+
+  <section id="historySec" class="hidden">
+    <h2>4. 本机核算记录（仅内部）</h2>
+    <div id="history"></div>
+  </section>
+</main>
+<script>
+let state = null;
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if(!r.ok) throw {status: r.status, body};
+  return body;
+}
+function esc(s){return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function showErr(el, e){
+  let text = '操作失败';
+  const d = e.body && e.body.detail;
+  if(typeof d === 'string') text = d;
+  else if(d && d.message) text = d.message;
+  el.className = 'msg err';
+  el.textContent = text;
+}
+function codes(s){
+  // T=受检未检出 D=检出 U=未受检，转成单字中文便于紧凑展示
+  return (s || []).map(c => c === 'D' ? '检' : c === 'T' ? '受' : '未').join(' / ');
+}
+function stateTable(rows){
+  if(!rows || !rows.length) return '<span class="sub">无</span>';
+  let h = '<table><tr><th>首轮</th><th>第 2 轮</th><th>第 3 轮</th><th>人数</th></tr>';
+  for(const r of rows){
+    h += '<tr>' + r.codes.map(c => `<td class="statecell">${c === 'D' ? '检' : c === 'T' ? '受' : '未'}</td>`).join('')
+       + `<td>${r.count}</td></tr>`;
+  }
+  return h + '</table>';
+}
+
+async function load(){
+  state = await api('/api/reconcile/history');
+  const has = state.imported;
+  document.getElementById('noData').style.display = has ? 'none' : 'block';
+  if(!has) return;
+
+  let h = '<table><tr><th>分区</th><th>年龄组</th><th>人数</th><th>首轮检出数</th></tr>';
+  for(const c of state.cells)
+    h += `<tr><td>${esc(c.district)}</td><td>${esc(c.age_group)}</td><td>${c.population}</td><td>${c.detected}</td></tr>`;
+  document.getElementById('survey').innerHTML = h + '</table>';
+
+  renderHistory(state.records);
+}
+
+function renderHistory(records){
+  const sec = document.getElementById('historySec');
+  sec.classList.toggle('hidden', !records.length);
+  if(!records.length) return;
+  document.getElementById('history').innerHTML = records.map(r =>
+    `<details class="rec"><summary>#${r.id} · ${esc(r.created_at)} · ${esc(r.filename)} · `
+    + (r.feasible ? '<span class="badge-ok">计数可同时成立</span>' : '<span class="badge-bad">存在冲突</span>')
+    + '（点击展开结果）</summary>' + renderResult(r.result) + '</details>'
+  ).join('');
+}
+
+function renderResult(res){
+  if(!res) return '';
+  if(!res.feasible){
+    const c = res.conflict || {};
+    let h = `<div class="conflict"><b>${esc(c.message || '计数冲突')}</b>`;
+    if(c.cells && c.cells.length){
+      h += '<h3>冲突格</h3><table><tr><th>分区</th><th>年龄组</th><th>人数</th><th>首轮检出</th>'
+         + '<th>第 2 轮受检</th><th>第 2 轮检出</th><th>第 3 轮受检</th><th>第 3 轮检出</th><th class="left">涉及填报项</th></tr>';
+      for(const x of c.cells)
+        h += `<tr><td>${esc(x.district)}</td><td>${esc(x.age_group)}</td><td>${x.population}</td><td>${x.detected1}</td>`
+           + `<td>${x.tested2}</td><td>${x.detected2}</td><td>${x.tested3}</td><td>${x.detected3}</td>`
+           + `<td class="left">${esc(x.fields.join('、'))}</td></tr>`;
+      h += '</table>';
+    }
+    if(c.pairs && c.pairs.length){
+      h += '<h3>冲突配对行</h3><table><tr><th>轮次对</th><th>两轮均受检</th><th>两轮均检出</th><th class="left">涉及填报项</th></tr>';
+      for(const p of c.pairs)
+        h += `<tr><td>${p.rounds.join('-')}</td><td>${p.both_tested}</td><td>${p.both_detected}</td>`
+           + `<td class="left">${esc(p.fields.join('、'))}</td></tr>`;
+      h += '</table>';
+    }
+    if(c.reasons && c.reasons.length){
+      h += '<h3>可直接判定的原因</h3><ul>' + c.reasons.map(r => `<li>${esc(r)}</li>`).join('') + '</ul>';
+    }
+    return h + '<p class="hint">约束无法同时成立，未生成全表上下界。</p></div>';
+  }
+
+  const t = res.total;
+  let h = '<p>'
+    + `<span class="stat">全表至少检出一次：<b>${t.min} ~ ${t.max}</b> 人</span>`
+    + `<span class="stat">调查总人数：<b>${res.cells.reduce((s, c) => s + c.population, 0)}</b> 人</span>`
+    + '</p><p class="hint">区间由所有计数可同时成立的整数分配求出，是可达的上下界（端点各有一份分配示例）。</p>';
+
+  h += '<details><summary>全表达到下界时的完整状态分配（点击展开）</summary>'
+     + assignmentTable(t.min_assignment) + '</details>';
+  h += '<details><summary>全表达到上界时的完整状态分配（点击展开）</summary>'
+     + assignmentTable(t.max_assignment) + '</details>';
+
+  h += '<h3>各格至少检出一次的人数上下界</h3>'
+     + '<div class="legend">状态码：<code>检</code> 检出，<code>受</code> 受检未检出，<code>未</code> 未受检。'
+     + '「端点状态组合」各自来自一份满足全部计数的整数分配（不同格的端点组合不保证能拼成同一份分配）；'
+     + '需要整表同时达到时，请看上方全表下界/上界分配。</div>'
+     + '<table><tr><th>分区</th><th>年龄组</th><th>人数</th><th>首轮检出</th>'
+     + '<th>第 2 轮受检 / 检出</th><th>第 3 轮受检 / 检出</th>'
+     + '<th>至少检出一次下界</th><th>上界</th><th class="left">端点状态组合</th></tr>';
+  for(const c of res.cells){
+    h += `<tr><td>${esc(c.district)}</td><td>${esc(c.age_group)}</td><td>${c.population}</td><td>${c.detected1}</td>`
+       + `<td>${c.tested2} / ${c.detected2}</td><td>${c.tested3} / ${c.detected3}</td>`
+       + `<td><b>${c.min}</b></td><td><b>${c.max}</b></td>`
+       + `<td class="left"><details><summary>展开下界 / 上界组合</summary>`
+       + `<div class="sub">下界 ${c.min} 人（该格单独达到下界的一份分配）：</div>${stateTable(c.min_states)}`
+       + `<div class="sub">上界 ${c.max} 人（该格单独达到上界的一份分配）：</div>${stateTable(c.max_states)}`
+       + '</details></td></tr>';
+  }
+  h += '</table>';
+
+  h += '<h3>轮次对填报值</h3><table><tr><th>轮次对</th><th>两轮均受检人数</th><th>两轮均检出人数</th></tr>'
+     + res.pairs.map(p => `<tr><td>${p.rounds.join('-')}</td><td>${p.both_tested}</td><td>${p.both_detected}</td></tr>`).join('')
+     + '</table>';
+  return h;
+}
+
+function assignmentTable(assignment){
+  if(!assignment || !assignment.length) return '<p class="sub">无</p>';
+  let h = '<table><tr><th>分区</th><th>年龄组</th><th class="left">状态组合（首轮 / 第 2 轮 / 第 3 轮 → 人数）</th></tr>';
+  for(const cell of assignment){
+    const parts = cell.states.map(s => `${codes(s.codes)} → ${s.count}`).join('；') || '无';
+    h += `<tr><td>${esc(cell.district)}</td><td>${esc(cell.age_group)}</td><td class="left">${esc(parts)}</td></tr>`;
+  }
+  return h + '</table>';
+}
+
+async function downloadTemplate(){
+  const el = document.getElementById('upMsg');
+  try{
+    const r = await fetch('/api/reconcile/template');
+    if(!r.ok){ const b = await r.json().catch(() => ({})); throw {body: b}; }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'reconcile_template.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    el.className = 'msg info';
+    el.textContent = '模板已按当前固定调查生成并下载。';
+  }catch(e){ showErr(el, e); }
+}
+
+async function uploadText(text, filename){
+  const el = document.getElementById('upMsg');
+  const fd = new FormData();
+  fd.append('file', new Blob([text], {type: 'text/csv'}), filename);
+  el.className = 'msg info';
+  el.textContent = '核算中…（格数较多时可能需要数秒）';
+  try{
+    const r = await api('/api/reconcile', {method: 'POST', body: fd});
+    el.className = 'msg ' + (r.result.feasible ? 'ok' : 'err');
+    el.textContent = r.result.feasible
+      ? `核算完成（记录 #${r.record.id}）：全表至少检出一次 ${r.result.total.min} ~ ${r.result.total.max} 人。`
+      : `计数冲突（记录 #${r.record.id}）：见下方冲突格，未生成全表结果。`;
+    document.getElementById('resultSec').classList.remove('hidden');
+    document.getElementById('result').innerHTML = renderResult(r.result);
+    document.getElementById('resultSec').scrollIntoView({behavior: 'smooth', block: 'start'});
+    await load();
+  }catch(e){ showErr(el, e); }
+}
+
+async function doUpload(){
+  const el = document.getElementById('upMsg');
+  const f = document.getElementById('file').files[0];
+  if(!f){ el.className = 'msg err'; el.textContent = '请选择 CSV 文件'; return; }
+  const text = await f.text();
+  await uploadText(text, f.name);
+}
+
+async function demoUpload(){
+  const el = document.getElementById('upMsg');
+  try{
+    const r = await fetch('/sample_reconcile.csv');
+    if(!r.ok) throw {body: {detail: '演示数据不可用'}};
+    await uploadText(await r.text(), 'sample_reconcile.csv');
+  }catch(e){ showErr(el, e); }
+}
+
+load();
+</script>
+</body>
+</html>

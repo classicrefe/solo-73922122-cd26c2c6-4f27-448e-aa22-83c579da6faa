@@ -3,7 +3,8 @@
 运行：python tests/selftest.py
 覆盖：导入校验、导入后不可更换、预览、安全/不安全发布、
 两窗口各自安全但合并不安全的重核拒绝、公开页不泄露格内检出数、
-公开记录落盘持久化。
+公开记录落盘持久化、多轮筛查累计检出核算（上下界、端点组合、
+冲突定位、核算不影响固定调查与公开记录）、核算结果与穷举一致。
 """
 
 import os
@@ -198,6 +199,252 @@ def run():
             ),
             str(outs[:2]),
         )
+
+        # ---- 11. 多轮筛查累计检出核算（内部页） ----
+        run_reconcile_checks(client)
+
+
+RECONCILE_OK = """分区,年龄组,轮次,受检人数,检出人数,两轮均受检人数,两轮均检出人数
+城东,青年,2,4,0,,
+城东,青年,3,6,3,,
+城东,老年,2,6,5,,
+城东,老年,3,9,8,,
+城西,青年,2,8,5,,
+城西,青年,3,7,5,,
+城西,老年,2,6,6,,
+城西,老年,3,5,4,,
+,,1-2,,,24,15
+,,1-3,,,27,15
+,,2-3,,,17,10
+"""
+
+
+def run_reconcile_checks(client):
+    sample = (Path(__file__).resolve().parent.parent / "sample_reconcile.csv").read_text(
+        encoding="utf-8"
+    )
+    before_state = client.get("/api/admin/state").json()
+    before_public = client.get("/api/public").json()
+
+    def upload(text, name="rec.csv"):
+        return client.post(
+            "/api/reconcile",
+            files={"file": (name, text.encode("utf-8"), "text/csv")},
+        )
+
+    # 11a. 模板
+    r = client.get("/api/reconcile/template")
+    lines = [ln for ln in r.text.lstrip("﻿").splitlines() if ln.strip()]
+    check("核算模板可下载且含 4 格×2 轮 + 3 配对行",
+          r.status_code == 200 and len(lines) == 1 + 8 + 3, r.text[:300])
+    check("示例核算 CSV 与页面演示数据一致", sample == RECONCILE_OK,
+          "sample_reconcile.csv 与测试内置样例不一致")
+
+    # 11b. 可行核算：上下界与端点组合
+    r = upload(sample, "sample_reconcile.csv")
+    ok = r.status_code == 200
+    j = r.json() if ok else {}
+    res = j.get("result", {})
+    check("示例核算请求成功且计数可同时成立",
+          ok and res.get("feasible") is True, r.text[:500])
+    check("全表至少检出一次上下界为 [31, 32]",
+          res.get("total", {}).get("min") == 31 and res["total"]["max"] == 32,
+          str({k: res["total"][k] for k in ("min", "max")} if res.get("total") else None))
+    bounds = {(c["district"], c["age_group"]): (c["min"], c["max"]) for c in res.get("cells", [])}
+    check("各格上下界符合穷举结果",
+          bounds == {("城东", "青年"): (3, 5), ("城东", "老年"): (8, 10),
+                     ("城西", "青年"): (8, 10), ("城西", "老年"): (8, 10)},
+          str(bounds))
+
+    def ever(rows):
+        return sum(x["count"] for x in rows if "D" in x["codes"])
+
+    check("每格下界/上界端点状态组合人数等于该端点",
+          all(ever(c["min_states"]) == c["min"] and ever(c["max_states"]) == c["max"]
+              for c in res.get("cells", [])))
+    check("全表下界分配的人数等于全表下界",
+          sum(ever(cell["states"]) for cell in res["total"]["min_assignment"]) == 31)
+    check("全表上界分配的人数等于全表上界",
+          sum(ever(cell["states"]) for cell in res["total"]["max_assignment"]) == 32)
+
+    def assignment_ok(assignment):
+        # 校验每份分配在各格内确实满足填报计数与三轮状态定义
+        by_cell = {(c["district"], c["age_group"]): c for c in res["cells"]}
+        for cell in assignment:
+            key = (cell["district"], cell["age_group"])
+            comp = {"U": 0, "T": 1, "D": 2}
+            stats = {1: [0, 0], 2: [0, 0], 3: [0, 0]}
+            for row in cell["states"]:
+                for rnd, code in enumerate(row["codes"], start=1):
+                    state = comp[code]
+                    if state in (1, 2):
+                        stats[rnd][0] += row["count"]
+                    if state == 2:
+                        stats[rnd][1] += row["count"]
+            c = by_cell[key]
+            if stats[2] != [c["tested2"], c["detected2"]]:
+                return False
+            if stats[3] != [c["tested3"], c["detected3"]]:
+                return False
+            if stats[1][1] != c["detected1"]:
+                return False
+            if sum(row["count"] for row in cell["states"]) != c["population"]:
+                return False
+        return True
+
+    check("全表端点分配满足所有格级计数",
+          assignment_ok(res["total"]["min_assignment"])
+          and assignment_ok(res["total"]["max_assignment"]))
+
+    # 11c. 冲突：单格检出>受检
+    conflict = sample.replace("城东,青年,2,4,0,,", "城东,青年,2,4,9,,")
+    r = upload(conflict)
+    j = r.json()
+    conflict_cells = [(c["district"], c["age_group"]) for c in j["result"]["conflict"]["cells"]]
+    check("检出人数>受检人数 判为冲突且不输出全表结果",
+          r.status_code == 200 and j["result"]["feasible"] is False
+          and "total" not in j["result"], r.text[:400])
+    check("冲突定位到具体格 城东/青年",
+          ("城东", "青年") in conflict_cells, str(conflict_cells))
+    check("冲突说明含可判定原因",
+          any("超过第 2 轮受检人数" in x for x in j["result"]["conflict"]["reasons"]),
+          str(j["result"]["conflict"]["reasons"]))
+
+    # 11d. 冲突：配对行与各格合计不符
+    pair_conflict = sample.replace(",,1-2,,,24,15", ",,1-2,,,23,15")
+    r = upload(pair_conflict)
+    j = r.json()
+    pairs = [tuple(p["rounds"]) for p in j["result"]["conflict"]["pairs"]]
+    check("第 1、2 轮均受检人数与第 2 轮受检合计不符 → 冲突定位到配对行",
+          r.status_code == 200 and j["result"]["feasible"] is False
+          and (1, 2) in pairs, str(pairs))
+
+    # 11e. 结构错误
+    r = upload("分区,年龄组,轮次,受检人数,检出人数,两轮均受检人数,两轮均检出人数\n")
+    check("空核算 CSV 被拒绝(400)", r.status_code == 400, r.text)
+    r = upload(sample.replace("城东,青年,2,4,0,,", "城东,青年,2,4,-1,,"))
+    check("负数填报被拒绝(400)", r.status_code == 400, r.text)
+    r = upload(sample.replace("城东,青年,2,4,0,,", "城东,青年,2,4.5,0,,"))
+    check("非整数填报被拒绝(400)", r.status_code == 400, r.text)
+    r = upload(sample.replace("城东,青年,2,4,0,,", "城东,未知,2,4,0,,"))
+    check("不在固定调查中的格被拒绝(400)", r.status_code == 400, r.text)
+    r = client.post("/api/reconcile", files={"file": ("x.csv", b"\xff\xfe", "text/csv")})
+    check("非 UTF-8 文件被拒绝(400)", r.status_code == 400, r.text)
+
+    # 11f. 核算不影响固定调查与公开记录
+    after_state = client.get("/api/admin/state").json()
+    after_public = client.get("/api/public").json()
+    check("核算后固定调查不变",
+          after_state["cells"] == before_state["cells"], "cells changed")
+    check("核算后公开记录不变",
+          after_public["publications"] == before_public["publications"], "publications changed")
+    check("核算数据不出现在公开接口",
+          "reconcile" not in str(after_public) and "reconciliations" not in str(after_public))
+    r = client.get("/public")
+    check("公开页不含核算入口/文字",
+          r.status_code == 200 and "核算" not in r.text and "/reconcile" not in r.text)
+    r = client.get("/reconcile")
+    check("内部核算页可访问", r.status_code == 200 and "核算" in r.text)
+    r = client.get("/api/reconcile/history")
+    j = r.json()
+    check("核算记录已落盘（3 次有效上传，含 1 次可行）",
+          r.status_code == 200 and len(j["records"]) == 3, str(len(j.get("records", []))))
+    check("核算记录区分可行/冲突",
+          sum(1 for x in j["records"] if x["feasible"]) == 1,
+          str([x["feasible"] for x in j["records"]]))
+
+    # 11g. 与穷举结果逐项对照（小规模，可完全枚举）
+    check_reconcile_matches_bruteforce()
+
+
+def check_reconcile_matches_bruteforce():
+    import itertools
+
+    from app.reconcile import PATTERNS, reconcile
+
+    def compositions(total, parts):
+        if parts == 1:
+            yield (total,)
+            return
+        for head in range(total + 1):
+            for rest in compositions(total - head, parts - 1):
+                yield (head,) + rest
+
+    def cell_vectors(comp):
+        return (
+            sum(n for n, p in zip(comp, PATTERNS) if p[0] == 2),
+            sum(n for n, p in zip(comp, PATTERNS) if p[1] >= 1),
+            sum(n for n, p in zip(comp, PATTERNS) if p[1] == 2),
+            sum(n for n, p in zip(comp, PATTERNS) if p[2] >= 1),
+            sum(n for n, p in zip(comp, PATTERNS) if p[2] == 2),
+        )
+
+    def brute(cells, inputs, pairs):
+        per_cell = [
+            [comp for comp in compositions(c["population"], len(PATTERNS))
+             if cell_vectors(comp) == (c["detected"], inputs[(c["district"], c["age_group"])]["tested2"],
+                                       inputs[(c["district"], c["age_group"])]["detected2"],
+                                       inputs[(c["district"], c["age_group"])]["tested3"],
+                                       inputs[(c["district"], c["age_group"])]["detected3"])]
+            for c in cells
+        ]
+        sols = []
+        for combo in itertools.product(*per_cell):
+            good = True
+            for (r1, r2), inp in pairs.items():
+                a, b = r1 - 1, r2 - 1
+                bt = sum(sum(n for n, p in zip(comp, PATTERNS) if p[a] >= 1 and p[b] >= 1)
+                         for comp in combo)
+                bd = sum(sum(n for n, p in zip(comp, PATTERNS) if p[a] == 2 and p[b] == 2)
+                         for comp in combo)
+                if (bt, bd) != (inp["both_tested"], inp["both_detected"]):
+                    good = False
+                    break
+            if good:
+                sols.append(combo)
+        ever = [sum(n for n, p in zip(comp, PATTERNS) if 2 in p) for comp in sols[0]]
+        cell_bounds = []
+        for i in range(len(cells)):
+            vals = [sum(n for n, p in zip(sol[i], PATTERNS) if 2 in p) for sol in sols]
+            cell_bounds.append((min(vals), max(vals)))
+        totals = [sum(sum(n for n, p in zip(sol[i], PATTERNS) if 2 in p)
+                      for i in range(len(cells))) for sol in sols]
+        return cell_bounds, (min(totals), max(totals)), len(sols)
+
+    # 由真实逐人状态构造的小规模算例（保证可行）
+    cells = [
+        {"district": "甲", "age_group": "青", "population": 4, "detected": 1},
+        {"district": "乙", "age_group": "青", "population": 4, "detected": 2},
+    ]
+    inputs = {}
+    pair = {(1, 2): [0, 0], (1, 3): [0, 0], (2, 3): [0, 0]}
+    people = {
+        ("甲", "青"): [(2, 0, 1), (1, 1, 2), (1, 2, 1), (1, 0, 0)],
+        ("乙", "青"): [(2, 2, 2), (2, 1, 0), (1, 0, 2), (1, 1, 1)],
+    }
+    for key, pats in people.items():
+        inputs[key] = {
+            "tested2": sum(1 for p in pats if p[1] >= 1),
+            "detected2": sum(1 for p in pats if p[1] == 2),
+            "tested3": sum(1 for p in pats if p[2] >= 1),
+            "detected3": sum(1 for p in pats if p[2] == 2),
+        }
+        for (a, b) in pair:
+            pair[(a, b)][0] += sum(1 for p in pats if p[a - 1] >= 1 and p[b - 1] >= 1)
+            pair[(a, b)][1] += sum(1 for p in pats if p[a - 1] == 2 and p[b - 1] == 2)
+    pairs = {k: {"both_tested": v[0], "both_detected": v[1]} for k, v in pair.items()}
+
+    expected_cells, expected_total, n_sols = brute(cells, inputs, pairs)
+    got = reconcile(cells, inputs, pairs)
+    got_cells = [(c["min"], c["max"]) for c in got["cells"]]
+    check("小规模算例穷举可行",
+          n_sols > 0, f"n_sols={n_sols}")
+    check("核算各格上下界与穷举完全一致",
+          got["feasible"] and got_cells == expected_cells,
+          f"brute={expected_cells} z3={got_cells}")
+    check("核算全表上下界与穷举完全一致",
+          (got["total"]["min"], got["total"]["max"]) == expected_total,
+          f"brute={expected_total} z3={(got['total']['min'], got['total']['max'])}")
 
 
 run()

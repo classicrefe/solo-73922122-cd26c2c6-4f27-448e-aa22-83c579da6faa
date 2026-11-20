@@ -2,6 +2,7 @@
 
 - cells：导入的调查格值（导入后不可更换，无更新/删除接口）。
 - publications：已获准公开的汇总记录（不可撤销，只插入，无更新/删除接口）。
+- reconciliations：内部核算记录（只插入；从不进入公开接口/公开页）。
 
 所有写操作均在单事务中完成：失败即整体回滚，不会留下半次发布。
 连接按操作创建，启用 WAL，重启后数据保留在 DB_PATH 指定的库文件中。
@@ -31,6 +32,14 @@ CREATE TABLE IF NOT EXISTS publications (
     age_groups TEXT NOT NULL,          -- JSON 数组
     total      INTEGER NOT NULL CHECK (total >= 0),
     created_at TEXT NOT NULL           -- ISO8601 UTC
+);
+CREATE TABLE IF NOT EXISTS reconciliations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,          -- ISO8601 UTC
+    filename   TEXT NOT NULL,          -- 上传文件名（仅展示）
+    feasible   INTEGER NOT NULL,       -- 0/1
+    payload    TEXT NOT NULL,          -- JSON：填报计数
+    result     TEXT NOT NULL           -- JSON：核算结果
 );
 """
 
@@ -106,3 +115,40 @@ def insert_publication(districts: list[str], age_groups: list[str], total: int) 
         "total": int(total),
         "created_at": created,
     }
+
+
+def insert_reconciliation(
+    filename: str, feasible: bool, payload: dict, result: dict
+) -> dict:
+    """单事务插入一条内部核算记录；失败回滚。"""
+    created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with closing(connect()) as conn, conn:
+        cur = conn.execute(
+            "INSERT INTO reconciliations (created_at, filename, feasible, payload, result) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                created,
+                filename,
+                1 if feasible else 0,
+                json.dumps(payload, ensure_ascii=False),
+                json.dumps(result, ensure_ascii=False),
+            ),
+        )
+        rid = cur.lastrowid
+    return {"id": rid, "created_at": created, "filename": filename}
+
+
+def get_reconciliations(limit: int = 50) -> list[dict]:
+    with closing(connect()) as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, filename, feasible, result FROM reconciliations "
+            "ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["feasible"] = bool(d["feasible"])
+        d["result"] = json.loads(d["result"])
+        out.append(d)
+    return out
